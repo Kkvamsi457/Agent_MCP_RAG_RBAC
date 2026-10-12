@@ -27,6 +27,9 @@ import {
   Save,
   PlusCircle,
   ArrowLeft,
+  Users,
+  Shield,
+  RefreshCw,
 } from "lucide-react";
 
 import { createRoot } from "react-dom/client";
@@ -90,6 +93,8 @@ function titleFrom(text) {
 function ChatApp({
   user,
   onPromptsClick,
+  onUsersClick,
+  onRolesClick,
   profileOpen,
   onProfileToggle,
   onLogout,
@@ -300,6 +305,10 @@ function ChatApp({
     setWorkingLabel("Agent is deciding which tool to use...");
     setBusy(true);
 
+    // Let React paint the routing status before starting the network request.
+    // Without this pause, fast responses can skip the first status visually.
+    await new Promise((resolve) => window.setTimeout(resolve, 350));
+
     setMenuId(null);
 
     const apiHistory = baseMessages.map((m) => ({
@@ -326,13 +335,41 @@ function ChatApp({
 
       const selectedTool = plan.tool;
 
-      const selectedLabel =
-        plan.tool_label ||
-        toolMeta[selectedTool]?.label ||
-        selectedTool ||
-        "Direct Answer";
+      const normalizedTool = String(selectedTool || "direct").toLowerCase();
+      const workingLabels = {
+        vector_search: "Using RAG tool...",
+        rag: "Using RAG tool...",
+        rag_search: "Using RAG tool...",
+        python: "Using Python interpreter tool...",
+        python_interpreter: "Using Python interpreter tool...",
+        calculator: "Using calculator tool...",
+        direct: "Direct answer...",
+        direct_answer: "Direct answer...",
+      };
+      const selectedWorkingLabel =
+        workingLabels[normalizedTool] ||
+        (String(plan.tool_label || "")
+          .toLowerCase()
+          .includes("python")
+          ? "Using Python interpreter tool..."
+          : String(plan.tool_label || "")
+                .toLowerCase()
+                .includes("calc")
+            ? "Using calculator tool..."
+            : String(plan.tool_label || "")
+                  .toLowerCase()
+                  .includes("rag") ||
+                String(plan.tool_label || "")
+                  .toLowerCase()
+                  .includes("search")
+              ? "Using RAG tool..."
+              : "Direct answer...");
 
-      setWorkingLabel(`Using ${selectedLabel}...`);
+      setWorkingLabel(selectedWorkingLabel);
+
+      // Keep the selected-tool status visible long enough to be painted before
+      // the answer request begins, even when the backend responds very quickly.
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
 
       const response = await fetch(`${API}/api/chat`, {
         method: "POST",
@@ -624,6 +661,12 @@ function ChatApp({
           </div>
 
           <div className="topbar-actions">
+            <button className="top-nav-btn" onClick={onUsersClick}>
+              <Users size={17} /> Users
+            </button>
+            <button className="top-nav-btn" onClick={onRolesClick}>
+              <Shield size={17} /> Roles
+            </button>
             <button className="top-nav-btn" onClick={onPromptsClick}>
               <Settings2 size={17} /> Prompts
             </button>
@@ -655,7 +698,10 @@ function ChatApp({
 
         <section className="chat-scroll" ref={chatRef}>
           {messages.length === 0 ? (
-            <LandingPage onExample={send} />
+            <>
+              <LandingPage onExample={send} />
+              {busy && <WorkingIndicator label={workingLabel} />}
+            </>
           ) : (
             <div className="conversation">
               {messages.map((message) => (
@@ -1152,7 +1198,7 @@ function App() {
     );
   return (
     <div className="signed-in-app">
-      {page === "prompts" ? (
+      {page !== "chat" ? (
         <>
           <header className="top-app-bar">
             <button
@@ -1161,6 +1207,26 @@ function App() {
             >
               <ArrowLeft size={17} /> Back to Assistant
             </button>
+            <div className="admin-page-nav">
+              <button
+                className={`top-nav-btn ${page === "users" ? "active" : ""}`}
+                onClick={() => setPage("users")}
+              >
+                <Users size={16} /> Users
+              </button>
+              <button
+                className={`top-nav-btn ${page === "roles" ? "active" : ""}`}
+                onClick={() => setPage("roles")}
+              >
+                <Shield size={16} /> Roles
+              </button>
+              <button
+                className={`top-nav-btn ${page === "prompts" ? "active" : ""}`}
+                onClick={() => setPage("prompts")}
+              >
+                <Settings2 size={16} /> Prompts
+              </button>
+            </div>
             <div className="profile-wrap">
               <button
                 className="profile-trigger"
@@ -1188,11 +1254,17 @@ function App() {
               )}
             </div>
           </header>
-          <PromptsPage
-            user={user}
-            token={token}
-            onBack={() => setPage("chat")}
-          />
+          {page === "prompts" ? (
+            <PromptsPage
+              user={user}
+              token={token}
+              onBack={() => setPage("chat")}
+            />
+          ) : page === "users" ? (
+            <UsersPage user={user} token={token} />
+          ) : (
+            <RolesPage user={user} token={token} />
+          )}
         </>
       ) : (
         <div className="chat-app-area">
@@ -1202,6 +1274,14 @@ function App() {
             onPromptsClick={() => {
               setProfileOpen(false);
               setPage("prompts");
+            }}
+            onUsersClick={() => {
+              setProfileOpen(false);
+              setPage("users");
+            }}
+            onRolesClick={() => {
+              setProfileOpen(false);
+              setPage("roles");
             }}
             profileOpen={profileOpen}
             onProfileToggle={() => setProfileOpen((v) => !v)}
@@ -1252,6 +1332,15 @@ function PromptsPage({ user, token, onBack }) {
   useEffect(() => {
     load();
   }, []);
+  if (!loading && error.startsWith("403 Forbidden")) {
+    return (
+      <main className="admin-page access-denied-page">
+        <div className="notice error-notice" role="alert">
+          {error}
+        </div>
+      </main>
+    );
+  }
   function reset() {
     setEditing(null);
     setForm({
@@ -1284,7 +1373,12 @@ function PromptsPage({ user, token, onBack }) {
         body: JSON.stringify(payload),
       });
       const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || "Could not save prompt");
+      if (!r.ok)
+        throw new Error(
+          r.status === 403
+            ? "403 Forbidden — you do not have permission to manage prompts."
+            : d.detail || "Could not save prompt",
+        );
       setNotice(
         editing
           ? "Prompt updated successfully."
@@ -1304,26 +1398,18 @@ function PromptsPage({ user, token, onBack }) {
         headers,
       });
       const d = await r.json();
-      if (!r.ok) throw new Error(d.detail || "Delete failed");
+      if (!r.ok)
+        throw new Error(
+          r.status === 403
+            ? "403 Forbidden — you do not have permission to delete prompts."
+            : d.detail || "Delete failed",
+        );
       setNotice("Prompt deleted.");
       await load();
     } catch (e) {
       setError(e.message);
     }
   }
-  if (user.role_code !== "admin")
-    return (
-      <main className="prompts-page">
-        <div className="prompts-denied">
-          <ShieldCheck size={36} />
-          <h2>403 Forbidden</h2>
-          <p>You do not have access to this page.</p>
-          <button className="primary-btn" onClick={onBack}>
-            Back to chat
-          </button>
-        </div>
-      </main>
-    );
   return (
     <main className="prompts-page">
       <div className="prompts-heading">
@@ -1444,6 +1530,365 @@ function PromptsPage({ user, token, onBack }) {
           </div>
         </form>
       </div>
+    </main>
+  );
+}
+
+function AdminOnlyNotice() {
+  return (
+    <main className="admin-page">
+      <div className="admin-denied">
+        <ShieldCheck size={36} />
+        <h2>403 Forbidden</h2>
+        <p>You do not have access to this page.</p>
+      </div>
+    </main>
+  );
+}
+
+function UsersPage({ user, token }) {
+  const [items, setItems] = useState([]);
+  const [roles, setRoles] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [form, setForm] = useState({
+    username: "",
+    display_name: "",
+    password: "",
+    role_id: "",
+  });
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
+
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      const [usersResponse, rolesResponse] = await Promise.all([
+        fetch(`${API}/api/users`, { headers }),
+        fetch(`${API}/api/roles`, { headers }),
+      ]);
+      const usersData = await usersResponse.json();
+      const rolesData = await rolesResponse.json();
+      if (!usersResponse.ok)
+        throw new Error(
+          usersResponse.status === 403
+            ? "403 Forbidden — you do not have access to Users."
+            : usersData.detail ||
+                `Unable to load users (HTTP ${usersResponse.status})`,
+        );
+      if (!rolesResponse.ok)
+        throw new Error(
+          rolesResponse.status === 403
+            ? "403 Forbidden — you do not have access to Roles."
+            : rolesData.detail ||
+                `Unable to load roles (HTTP ${rolesResponse.status})`,
+        );
+      setItems(usersData.users || []);
+      const activeRoles = (rolesData.roles || []).filter(
+        (role) => role.is_active,
+      );
+      setRoles(activeRoles);
+      setForm((previous) => ({
+        ...previous,
+        role_id:
+          previous.role_id ||
+          activeRoles.find((r) => r.code === "002")?.id ||
+          activeRoles[0]?.id ||
+          "",
+      }));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => {
+    load();
+  }, []);
+  if (!loading && error.startsWith("403 Forbidden")) {
+    return (
+      <main className="admin-page access-denied-page">
+        <div className="notice error-notice" role="alert">
+          {error}
+        </div>
+      </main>
+    );
+  }
+
+  async function createUser(e) {
+    e.preventDefault();
+    setError("");
+    setNotice("");
+    setSaving(true);
+    try {
+      const response = await fetch(`${API}/api/users`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(form),
+      });
+      const data = await response.json();
+      if (!response.ok)
+        throw new Error(
+          response.status === 403
+            ? "403 Forbidden — you do not have permission to create users."
+            : data.detail || "Unable to create user",
+        );
+      setNotice(`User "${data.username}" created successfully.`);
+      setForm({
+        username: "",
+        display_name: "",
+        password: "",
+        role_id: roles.find((r) => r.code === "002")?.id || roles[0]?.id || "",
+      });
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <main className="admin-page">
+      <div className="admin-heading">
+        <div>
+          <p className="admin-eyebrow">ACCESS CONTROL</p>
+          <h1>Users</h1>
+          <p>View registered accounts and add users to Atlas Agentic RAG.</p>
+        </div>
+        <button className="secondary-btn" onClick={load} disabled={loading}>
+          <RefreshCw size={15} /> Refresh
+        </button>
+      </div>
+      {error && <div className="notice error-notice">{error}</div>}
+      {notice && <div className="notice success-notice">{notice}</div>}
+      <div className="admin-grid">
+        <form className="admin-card user-create-form" onSubmit={createUser}>
+          <div className="admin-card-title">
+            <Users size={19} />
+            <div>
+              <h2>Add user</h2>
+              <p>Create a new account with a role from the database.</p>
+            </div>
+          </div>
+          <label>Username</label>
+          <input
+            value={form.username}
+            onChange={(e) => setForm({ ...form, username: e.target.value })}
+            minLength={1}
+            maxLength={80}
+            autoComplete="off"
+            required
+          />
+          <label>Display name</label>
+          <input
+            value={form.display_name}
+            onChange={(e) => setForm({ ...form, display_name: e.target.value })}
+            minLength={1}
+            maxLength={120}
+            required
+          />
+          <label>Password</label>
+          <input
+            type="password"
+            value={form.password}
+            onChange={(e) => setForm({ ...form, password: e.target.value })}
+            minLength={8}
+            maxLength={256}
+            autoComplete="new-password"
+            required
+          />
+          <label>Role</label>
+          <select
+            value={form.role_id}
+            onChange={(e) => setForm({ ...form, role_id: e.target.value })}
+            required
+          >
+            <option value="" disabled>
+              Select a role
+            </option>
+            {roles.map((role) => (
+              <option key={role.id} value={role.id}>
+                {role.code} — {role.name}
+              </option>
+            ))}
+          </select>
+          <button
+            className="primary-btn"
+            type="submit"
+            disabled={saving || !roles.length}
+          >
+            {saving ? "Creating user…" : "Create user"}
+          </button>
+          {!roles.length && !loading && (
+            <small className="form-hint">
+              No active roles are available. Check the Roles collection.
+            </small>
+          )}
+        </form>
+        <section className="admin-card user-list-card">
+          <div className="admin-card-title">
+            <Users size={19} />
+            <div>
+              <h2>Existing users</h2>
+              <p>
+                {items.length} account{items.length === 1 ? "" : "s"} registered
+              </p>
+            </div>
+          </div>
+          {loading ? (
+            <p className="empty-state">Loading users…</p>
+          ) : items.length === 0 ? (
+            <p className="empty-state">No users found.</p>
+          ) : (
+            <div className="admin-table-wrap">
+              <table className="admin-table">
+                <thead>
+                  <tr>
+                    <th>User</th>
+                    <th>Role</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {items.map((item) => (
+                    <tr key={item.id}>
+                      <td>
+                        <strong>{item.display_name || item.username}</strong>
+                        <small>@{item.username}</small>
+                      </td>
+                      <td>
+                        <span className="role-code">
+                          {item.role_code || "—"}
+                        </span>
+                        <small>{item.role_name}</small>
+                      </td>
+                      <td>
+                        <span
+                          className={`status-pill ${item.is_active ? "enabled" : "disabled"}`}
+                        >
+                          {item.is_active ? "Active" : "Inactive"}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      </div>
+    </main>
+  );
+}
+
+function RolesPage({ user, token }) {
+  const [roles, setRoles] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch(`${API}/api/roles`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await response.json();
+      if (!response.ok)
+        throw new Error(
+          response.status === 403
+            ? "403 Forbidden — you do not have access to Roles."
+            : data.detail || `Unable to load roles (HTTP ${response.status})`,
+        );
+      setRoles(data.roles || []);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => {
+    load();
+  }, []);
+  if (!loading && error.startsWith("403 Forbidden")) {
+    return (
+      <main className="admin-page access-denied-page">
+        <div className="notice error-notice" role="alert">
+          {error}
+        </div>
+      </main>
+    );
+  }
+  return (
+    <main className="admin-page">
+      <div className="admin-heading">
+        <div>
+          <p className="admin-eyebrow">ACCESS CONTROL</p>
+          <h1>Roles</h1>
+          <p>Read-only view of roles currently configured in MongoDB.</p>
+        </div>
+        <button className="secondary-btn" onClick={load} disabled={loading}>
+          <RefreshCw size={15} /> Refresh
+        </button>
+      </div>
+      {error && <div className="notice error-notice">{error}</div>}
+      <section className="admin-card roles-card">
+        <div className="admin-card-title">
+          <Shield size={19} />
+          <div>
+            <h2>Available roles</h2>
+            <p>
+              {roles.length} role{roles.length === 1 ? "" : "s"} found · Read
+              only
+            </p>
+          </div>
+        </div>
+        {loading ? (
+          <p className="empty-state">Loading roles…</p>
+        ) : roles.length === 0 ? (
+          <p className="empty-state">No roles found.</p>
+        ) : (
+          <div className="admin-table-wrap">
+            <table className="admin-table">
+              <thead>
+                <tr>
+                  <th>Role ID</th>
+                  <th>Code</th>
+                  <th>Name</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {roles.map((role) => (
+                  <tr key={role.id}>
+                    <td>
+                      <code>{role.id}</code>
+                    </td>
+                    <td>
+                      <span className="role-code">{role.code}</span>
+                    </td>
+                    <td>
+                      <strong>{role.name}</strong>
+                    </td>
+                    <td>
+                      <span
+                        className={`status-pill ${role.is_active ? "enabled" : "disabled"}`}
+                      >
+                        {role.is_active ? "Active" : "Inactive"}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </main>
   );
 }

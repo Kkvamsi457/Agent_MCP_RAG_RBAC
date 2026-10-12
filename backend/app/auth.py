@@ -125,40 +125,56 @@ def seed_database():
     permissions.create_index("code", unique=True)
     prompts.create_index("code", unique=True)
 
-    admin_perm = {
+    # Safely migrate the two original role codes while preserving their MongoDB
+    # ObjectIds, user.role_id references, and permission.role_id references.
+    # Role authorization is based on permission grants, never on a magic code.
+    for old_code, new_code in (("admin", "001"), ("user", "002")):
+        old_role = roles.find_one({"code": old_code})
+        if old_role and not roles.find_one({"code": new_code}):
+            roles.update_one(
+                {"_id": old_role["_id"]},
+                {"$set": {"code": new_code}},
+            )
+
+    roles.update_one(
+        {"code": "001"},
+        {"$setOnInsert": {"code": "001", "name": "Administrator", "is_active": True}},
+        upsert=True,
+    )
+    roles.update_one(
+        {"code": "002"},
+        {"$setOnInsert": {"code": "002", "name": "User", "is_active": True}},
+        upsert=True,
+    )
+
+    admin_role = roles.find_one({"code": "001"})
+    user_role = roles.find_one({"code": "002"})
+
+    admin_grants = {
         "prompts.read": True,
         "prompts.create": True,
         "prompts.update": True,
         "prompts.delete": True,
+        "users.read": True,
+        "users.create": True,
+        "roles.read": True,
     }
-    user_perm = {
+    user_grants = {
         "prompts.read": False,
         "prompts.create": False,
         "prompts.update": False,
         "prompts.delete": False,
+        "users.read": False,
+        "users.create": False,
+        "roles.read": False,
     }
 
-    for code, name, grants in [
-        ("admin", "Administrator", admin_perm),
-        ("user", "User", user_perm),
-    ]:
-        roles.update_one(
-            {"code": code},
-            {
-                "$setOnInsert": {
-                    "code": code,
-                    "name": name,
-                    "is_active": True,
-                }
-            },
-            upsert=True,
-        )
-
-        role = roles.find_one({"code": code})
+    for role, grants in ((admin_role, admin_grants), (user_role, user_grants)):
         permissions.update_one(
-            {"code": f"{code}_permissions"},
+            {"role_id": role["_id"]},
             {
                 "$set": {
+                    "code": f"{role['code']}_permissions",
                     "role_id": role["_id"],
                     "grants": grants,
                 }
@@ -168,38 +184,28 @@ def seed_database():
 
     username = os.getenv("ADMIN_USERNAME", "admin").strip()
     password = os.getenv("ADMIN_PASSWORD", "")
-
     if not password:
         raise RuntimeError("Set ADMIN_PASSWORD in backend/.env")
 
-    admin_role = roles.find_one({"code": "admin"})
     existing = users.find_one({"username": username})
-
-    # Create the configured admin only if the account does not already exist.
-    # Existing passwords are never overwritten on application restart.
     if existing is None:
-        users.insert_one(
-            {
-                "username": username,
-                "display_name": username,
-                "password_hash": hash_password(password),
-                "role_id": admin_role["_id"],
-                "is_active": True,
-                "created_at": datetime.now(timezone.utc),
-            }
-        )
+        users.insert_one({
+            "username": username,
+            "display_name": username,
+            "password_hash": hash_password(password),
+            "role_id": admin_role["_id"],
+            "is_active": True,
+            "created_at": datetime.now(timezone.utc),
+        })
 
-    # Safe, additive migration for legacy records.
+    # Add role_id to legacy users without overwriting existing IDs or passwords.
     for legacy in users.find({"role_id": {"$exists": False}}):
-        role_code = str(legacy.get("role", "user")).lower()
-        role_doc = roles.find_one({"code": role_code})
-        if not role_doc:
-            role_doc = roles.find_one({"code": "user"})
-
-        if role_doc:
+        old_code = str(legacy.get("role", "002")).lower()
+        target = admin_role if old_code in {"admin", "001"} else user_role
+        if target:
             users.update_one(
                 {"_id": legacy["_id"]},
-                {"$set": {"role_id": role_doc["_id"]}},
+                {"$set": {"role_id": target["_id"]}},
             )
 
 
@@ -265,6 +271,8 @@ def current_user(
             detail="Your role is inactive.",
         )
 
+    grant = permissions.find_one({"role_id": role["_id"]}) or {}
+    grants = grant.get("grants", {})
     return {
         "id": str(user["_id"]),
         "username": user["username"],
@@ -272,6 +280,7 @@ def current_user(
         "role_id": str(role["_id"]),
         "role_code": role["code"],
         "role_name": role["name"],
+        "is_admin": bool(grants.get("prompts.read", False)),
     }
 
 
@@ -309,7 +318,8 @@ def register_user(
     username: str,
     password: str,
     display_name: str,
-    role_code: str = "user",
+    role_id: str | None = None,
+    role_code: str | None = None,
 ):
     username = username.strip()
     display_name = display_name.strip()
@@ -320,17 +330,21 @@ def register_user(
             detail="Username, password and display name are required.",
         )
 
-    if role_code not in {"admin", "user"}:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="role_code must be 'admin' or 'user'.",
-        )
+    role = None
+    if role_id:
+        try:
+            role = roles.find_one({"_id": ObjectId(role_id), "is_active": True})
+        except Exception:
+            role = None
+    elif role_code:
+        role = roles.find_one({"code": role_code.strip(), "is_active": True})
+    else:
+        role = roles.find_one({"code": "002", "is_active": True})
 
-    role = roles.find_one({"code": role_code, "is_active": True})
     if not role:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The requested role is not configured or active.",
+            detail="The selected role does not exist or is inactive.",
         )
 
     now = datetime.now(timezone.utc)
@@ -342,7 +356,6 @@ def register_user(
         "is_active": True,
         "created_at": now,
     }
-
     try:
         result = users.insert_one(document)
     except DuplicateKeyError:
@@ -355,6 +368,7 @@ def register_user(
         "id": str(result.inserted_id),
         "username": username,
         "display_name": display_name,
+        "role_id": str(role["_id"]),
         "role_code": role["code"],
         "role_name": role["name"],
         "message": "User registered successfully.",

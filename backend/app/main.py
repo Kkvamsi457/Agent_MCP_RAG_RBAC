@@ -62,7 +62,8 @@ class RegisterRequest(BaseModel):
     username: str = Field(min_length=1, max_length=80)
     password: str = Field(min_length=8, max_length=256)
     display_name: str = Field(min_length=1, max_length=120)
-    role_code: str = Field(default="user", pattern=r"^(admin|user)$")
+    role_id: Optional[str] = None
+    role_code: Optional[str] = None
 
 
 class PromptCreate(BaseModel):
@@ -116,6 +117,7 @@ def login(req: LoginRequest):
             ),
             "role_code": user["role_code"],
             "role_name": user["role_name"],
+            "is_admin": bool((auth.permissions.find_one({"role_id": user["role_id"]}, {"grants.prompts.read": 1}) or {}).get("grants", {}).get("prompts.read", False)),
         },
     }
 
@@ -154,8 +156,51 @@ def register(req: RegisterRequest, user=Depends(admin_user)):
         username=req.username,
         password=req.password,
         display_name=req.display_name,
+        role_id=req.role_id,
         role_code=req.role_code,
     )
+
+
+@app.get("/api/users")
+def list_users(user=Depends(admin_user)):
+    result = []
+    for item in auth.users.find({}).sort("username", 1):
+        role = auth.roles.find_one({"_id": item.get("role_id")}) or {}
+        result.append({
+            "id": str(item["_id"]),
+            "username": item.get("username", ""),
+            "display_name": item.get("display_name", item.get("username", "")),
+            "role_id": str(item["role_id"]) if item.get("role_id") else None,
+            "role_code": role.get("code", ""),
+            "role_name": role.get("name", "Unknown role"),
+            "is_active": item.get("is_active", True),
+            "created_at": item["created_at"].isoformat() if item.get("created_at") else None,
+        })
+    return {"users": result}
+
+
+@app.post("/api/users", status_code=status.HTTP_201_CREATED)
+def create_user(req: RegisterRequest, user=Depends(admin_user)):
+    return auth.register_user(
+        username=req.username,
+        password=req.password,
+        display_name=req.display_name,
+        role_id=req.role_id,
+        role_code=req.role_code,
+    )
+
+
+@app.get("/api/roles")
+def list_roles(user=Depends(admin_user)):
+    result = []
+    for role in auth.roles.find({}).sort("code", 1):
+        result.append({
+            "id": str(role["_id"]),
+            "code": role.get("code", ""),
+            "name": role.get("name", ""),
+            "is_active": role.get("is_active", True),
+        })
+    return {"roles": result}
 
 
 @app.get("/api/prompts")
